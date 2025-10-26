@@ -1,221 +1,246 @@
 #!/usr/bin/env python3
 """
-Smart Block Detection and Removal System
+====================================================================
+SMART BLOCK DETECTION & REMOVAL SYSTEM  (Edge AI + IIoT + Cloud)
+====================================================================
 
-This Python script integrates key IoT components to automate defect detection in blocks
-moving on a conveyor system. It combines real-time vision, proximity sensing, gas detection,
-and cloud-based monitoring to ensure safety and quality control.
+High-level, modular implementation for an Industry 4.0 quality-control
+node running on a Raspberry Pi.  The system fuses vision, proximity,
+and environmental sensing for intelligent defect detection and
+actuation, streaming structured telemetry to a cloud broker (PubNub).
 
-Components:
- - HuskyLens AI camera for visual classification
- - Ultrasonic sensor for proximity detection
- - MQ2 gas sensor for anomaly detection
- - Servo motor to eject defective blocks
- - RGB LEDs and buzzer for local alerts
- - PubNub for secure remote event publishing (with auth key)
+Subsystems
+----------
+🧠  Vision Module:        HuskyLens AI camera for on-device inference
+🌐  Cloud Telemetry:      PubNub with Auth-Key security
+⚙️  Actuation Layer:      Servo ejector, RGB LED status, buzzer alerts
+📡  Sensors:              Ultrasonic (distance) + MQ-2 (gas/anomaly)
+💾  Edge Runtime:         Median filtering, debounce logic, event cache
+====================================================================
 """
 
-import RPi.GPIO as GPIO
-import time
-from huskylib import HuskyLensLibrary
+from __future__ import annotations
+import os, time, statistics, asyncio, contextlib
+from dataclasses import dataclass
 from dotenv import load_dotenv
-import os
+import RPi.GPIO as GPIO
+from huskylib import HuskyLensLibrary
 from pubnub.pnconfiguration import PNConfiguration
 from pubnub.pubnub import PubNub
 
-# ----------------- Load Environment Variables -----------------
-load_dotenv()
+# ------------------------------------------------------------------
+# Configuration Layer
+# ------------------------------------------------------------------
+load_dotenv()  # load secure keys from .env file
 
-# ----------------- PubNub Configuration -----------------
-pnconfig = PNConfiguration()
-pnconfig.publish_key = os.getenv("PUB_KEY")
-pnconfig.subscribe_key = os.getenv("SUB_KEY")
-pnconfig.uuid = os.getenv("UUID")
-pnconfig.auth_key = os.getenv("AUTH_TOKEN")  # Include auth token for secure access
+@dataclass(frozen=True)
+class Pins:
+    GREEN_LED: int = 22
+    YELLOW_LED: int = 27
+    RED_LED: int = 17
+    SERVO: int = 16
+    ULTRA_TRIG: int = 23
+    ULTRA_ECHO: int = 25
+    MQ2: int = 5
+    BUZZER: int = 6
 
-pubnub = PubNub(pnconfig)
 
-# Publishes a structured event to the block_channel
-def publish_event(event_type, data=None):
-    message = {"event": event_type}
-    if data:
-        message.update(data)
-    try:
-        pubnub.publish().channel("block_channel").message(message).sync()
-    except Exception as e:
-        print("[PUBNUB ERROR]", e)
+# ------------------------------------------------------------------
+# Utility: PubNub Client
+# ------------------------------------------------------------------
+class CloudBridge:
+    """Secure PubNub publisher with basic sync publishing."""
+    def __init__(self):
+        cfg = PNConfiguration()
+        cfg.publish_key   = os.getenv("PUB_KEY")
+        cfg.subscribe_key = os.getenv("SUB_KEY")
+        cfg.uuid          = os.getenv("UUID")
+        cfg.auth_key      = os.getenv("AUTH_TOKEN")
+        self._pubnub = PubNub(cfg)
 
-# ----------------- GPIO Setup -----------------
-GPIO.setmode(GPIO.BCM)
+    def publish(self, event: str, **payload):
+        msg = {"event": event, **payload}
+        with contextlib.suppress(Exception):
+            self._pubnub.publish().channel("block_channel").message(msg).sync()
 
-# LED Pins
-GREEN_LED = 22
-YELLOW_LED = 27
-RED_LED = 17
-GPIO.setup(GREEN_LED, GPIO.OUT)
-GPIO.setup(YELLOW_LED, GPIO.OUT)
-GPIO.setup(RED_LED, GPIO.OUT)
 
-# Servo Configuration
-SERVO_PIN = 16  # GPIO16 (Physical Pin 36)
-GPIO.setup(SERVO_PIN, GPIO.OUT)
-servo_pwm = GPIO.PWM(SERVO_PIN, 50)
-servo_pwm.start(7.5)  # Neutral starting point
-print("[INIT] Servo initialized to neutral position")
-time.sleep(1.0)
+# ------------------------------------------------------------------
+# Hardware Abstraction Layer
+# ------------------------------------------------------------------
+class IOController:
+    """Wraps GPIO primitives into expressive methods."""
+    def __init__(self, pins: Pins):
+        self.p = pins
+        GPIO.setmode(GPIO.BCM)
 
-# Ultrasonic Sensor Pins
-ULTRA_TRIG = 23
-ULTRA_ECHO = 25
-GPIO.setup(ULTRA_TRIG, GPIO.OUT)
-GPIO.setup(ULTRA_ECHO, GPIO.IN)
+        # Output devices
+        for led in (self.p.GREEN_LED, self.p.YELLOW_LED, self.p.RED_LED):
+            GPIO.setup(led, GPIO.OUT)
+        GPIO.setup(self.p.SERVO, GPIO.OUT)
+        GPIO.setup(self.p.BUZZER, GPIO.OUT)
 
-# MQ2 Gas Sensor and Buzzer
-MQ2_PIN = 5
-BUZZER_PIN = 6
-GPIO.setup(MQ2_PIN, GPIO.IN)
-GPIO.setup(BUZZER_PIN, GPIO.OUT)
+        # Sensors
+        GPIO.setup(self.p.ULTRA_TRIG, GPIO.OUT)
+        GPIO.setup(self.p.ULTRA_ECHO, GPIO.IN)
+        GPIO.setup(self.p.MQ2, GPIO.IN)
 
-# HuskyLens Initialization
-try:
-    huskyLens = HuskyLensLibrary("I2C", "", address=0x32)
-except Exception as e:
-    print("[ERROR] HuskyLens initialization failed:", e)
-    huskyLens = None
+        # Servo init
+        self._servo = GPIO.PWM(self.p.SERVO, 50)
+        self._servo.start(7.5)
+        print("[INIT] Hardware initialized.")
 
-# ----------------- Helper Functions -----------------
+    # ------------- Actuators -------------
+    def leds(self, *, green=False, yellow=False, red=False):
+        GPIO.output(self.p.GREEN_LED, green)
+        GPIO.output(self.p.YELLOW_LED, yellow)
+        GPIO.output(self.p.RED_LED, red)
 
-def set_leds(green=False, yellow=False, red=False):
-    GPIO.output(GREEN_LED, green)
-    GPIO.output(YELLOW_LED, yellow)
-    GPIO.output(RED_LED, red)
+    def buzz(self, duration=0.8):
+        GPIO.output(self.p.BUZZER, True)
+        time.sleep(duration)
+        GPIO.output(self.p.BUZZER, False)
 
-# Returns a single distance measurement from ultrasonic sensor
-def measure_distance_once():
-    GPIO.output(ULTRA_TRIG, False)
-    time.sleep(0.0002)
-    GPIO.output(ULTRA_TRIG, True)
-    time.sleep(0.00001)
-    GPIO.output(ULTRA_TRIG, False)
-    pulse_start, pulse_end = None, None
-    timeout = time.time() + 0.04
-    while GPIO.input(ULTRA_ECHO) == 0 and time.time() < timeout:
-        pulse_start = time.time()
-    if pulse_start is None:
-        return 999
-    timeout = time.time() + 0.04
-    while GPIO.input(ULTRA_ECHO) == 1 and time.time() < timeout:
-        pulse_end = time.time()
-    if pulse_end is None:
-        return 999
-    return (pulse_end - pulse_start) * 17150
+    def servo_sweep(self):
+        print("[ACTION] Servo sweep executing.")
+        for duty in (7.5, 2.5, 7.5, 0):
+            self._servo.ChangeDutyCycle(duty)
+            time.sleep(0.3)
 
-# Averages multiple ultrasonic readings for accuracy
-def measure_distance():
-    distances = sorted([measure_distance_once() for _ in range(7)])
-    return distances[len(distances)//2]
+    # ------------- Sensors -------------
+    def distance_cm(self, samples=5) -> float:
+        """Median-filtered ultrasonic distance."""
+        vals = []
+        for _ in range(samples):
+            GPIO.output(self.p.ULTRA_TRIG, False)
+            time.sleep(0.0002)
+            GPIO.output(self.p.ULTRA_TRIG, True)
+            time.sleep(0.00001)
+            GPIO.output(self.p.ULTRA_TRIG, False)
 
-# Executes a servo sweep to remove defective blocks
-def sweep_bad_block_servo():
-    print("[ACTION] Executing servo sweep...")
-    servo_pwm.ChangeDutyCycle(7.5)
-    time.sleep(0.5)
-    servo_pwm.ChangeDutyCycle(2.5)
-    time.sleep(0.5)
-    servo_pwm.ChangeDutyCycle(7.5)
-    time.sleep(0.3)
-    servo_pwm.ChangeDutyCycle(0)
-    print("[ACTION] Sweep complete.")
+            start, end = None, None
+            timeout = time.time() + 0.04
+            while GPIO.input(self.p.ULTRA_ECHO) == 0 and time.time() < timeout:
+                start = time.time()
+            while GPIO.input(self.p.ULTRA_ECHO) == 1 and time.time() < timeout:
+                end = time.time()
+            if start and end:
+                vals.append((end - start) * 17150)
+        return statistics.median(vals) if vals else 999.0
 
-# Gas detection with debounce logic and alerting
+    def gas_triggered(self, threshold=0.5) -> bool:
+        """Simple threshold on MQ2 digital signal."""
+        readings = [GPIO.input(self.p.MQ2) for _ in range(3)]
+        return sum(readings)/len(readings) > threshold
 
-gas_count = 0
-no_gas_counter = 0
-shutdown_requested = False
+    # ------------- Cleanup -------------
+    def shutdown(self):
+        self._servo.ChangeDutyCycle(0)
+        self._servo.stop()
+        GPIO.cleanup()
+        print("[SYSTEM] GPIO cleanup complete.")
 
-def check_gas_and_alert():
-    global gas_count, no_gas_counter, shutdown_requested
-    gas_readings = [GPIO.input(MQ2_PIN) for _ in range(3)]
-    avg_gas_value = sum(gas_readings) / len(gas_readings)
-    if avg_gas_value > 0.5:
-        gas_count += 1
-        no_gas_counter = 0
-        print(f"[ALERT] Gas detected ({gas_count}/3) | MQ2 Reading: {avg_gas_value:.2f}")
-        publish_event("Gas Detected", {"level": gas_count})
-        GPIO.output(BUZZER_PIN, GPIO.HIGH)
-        GPIO.output(RED_LED, GPIO.HIGH)
-        time.sleep(1)
-        GPIO.output(BUZZER_PIN, GPIO.LOW)
-        GPIO.output(RED_LED, GPIO.LOW)
-        if gas_count >= 3:
-            publish_event("System Shutdown", {"reason": "Gas threshold exceeded"})
-            shutdown_requested = True
-    else:
-        no_gas_counter += 1
-        if no_gas_counter >= 3:
-            gas_count = 0
 
-# ----------------- Main Control Loop -----------------
+# ------------------------------------------------------------------
+# Core Intelligence Layer
+# ------------------------------------------------------------------
+class SmartBlockSystem:
+    """High-level orchestration of sensing, vision, and actuation."""
 
-last_servo_time = 0
-servo_cooldown = 2
+    def __init__(self):
+        self.hw = IOController(Pins())
+        self.cloud = CloudBridge()
+        self.husky = self._init_huskylens()
+        self.gas_counter = 0
+        self.last_sweep = 0.0
+        self.cooldown = 2.0
 
-try:
-    while True:
-        if shutdown_requested:
-            print("[SYSTEM] Shutting down due to repeated gas detection.")
-            break
+    @staticmethod
+    def _init_huskylens():
+        try:
+            cam = HuskyLensLibrary("I2C", "", address=0x32)
+            print("[INIT] HuskyLens connected.")
+            return cam
+        except Exception as e:
+            print(f"[WARN] HuskyLens unavailable: {e}")
+            return None
 
-        distance = measure_distance()
-        print(f"[INFO] Ultrasonic Distance: {distance:.1f} cm")
-        publish_event("Distance Reading", {"distance_cm": round(distance, 1)})
-        check_gas_and_alert()
+    # ------------- Sensor + Vision Fusion -------------
+    def read_environment(self) -> dict:
+        """Collect multi-sensor snapshot."""
+        dist = self.hw.distance_cm()
+        gas  = self.hw.gas_triggered()
+        return {"distance_cm": round(dist, 1), "gas_alert": gas}
 
-        if distance < 15:
-            print("[WARNING] Object too close. System paused.")
-            set_leds(red=True, green=False, yellow=False)
-            publish_event("Proximity Warning", {"distance": distance})
+    def classify_block(self):
+        """Obtain block ID using onboard AI vision."""
+        if not self.husky:
+            return None
+        with contextlib.suppress(Exception):
+            self.husky.requestAll()
+            blocks = self.husky.learnedBlocks()
+            if isinstance(blocks, list) and blocks:
+                return blocks[0].ID
+            elif blocks:
+                return blocks.ID
+        return None
+
+    # ------------- Decision Logic -------------
+    def handle_gas(self, gas_alert: bool):
+        if gas_alert:
+            self.gas_counter += 1
+            self.hw.leds(red=True)
+            self.hw.buzz(0.6)
+            self.cloud.publish("Gas Detected", level=self.gas_counter)
+            print(f"[ALERT] Gas anomaly detected ({self.gas_counter}/3).")
+            if self.gas_counter >= 3:
+                self.cloud.publish("System Shutdown", reason="Gas threshold exceeded")
+                raise SystemExit("[CRITICAL] Gas threshold reached.")
         else:
-            current_block = None
-            if huskyLens:
-                try:
-                    huskyLens.requestAll()
-                    time.sleep(0.2)
-                    blocks = huskyLens.learnedBlocks()
-                    if isinstance(blocks, list) and len(blocks) > 0:
-                        current_block = blocks[0]
-                    elif blocks is not None:
-                        current_block = blocks
-                except Exception:
-                    pass
+            self.gas_counter = max(0, self.gas_counter - 1)
 
-            if current_block:
-                block_id = current_block.ID
-                if block_id == 1:
-                    set_leds(yellow=True)
-                    print(f"[DETECT] Defective block detected (ID {block_id}).")
-                    publish_event("Defective Block", {"block_id": block_id})
-                    if time.time() - last_servo_time > servo_cooldown:
-                        print("[ACTION] Initiating servo action.")
-                        sweep_bad_block_servo()
-                        last_servo_time = time.time()
+    def handle_block(self, block_id):
+        """Decision path for block classification."""
+        if block_id == 1:
+            self.hw.leds(yellow=True)
+            print(f"[DETECT] Defective block (ID {block_id}).")
+            self.cloud.publish("Defective Block", block_id=block_id)
+            if time.time() - self.last_sweep > self.cooldown:
+                self.hw.servo_sweep()
+                self.last_sweep = time.time()
+        elif block_id is not None:
+            self.hw.leds(green=True)
+            print(f"[DETECT] Valid block (ID {block_id}).")
+            self.cloud.publish("Valid Block", block_id=block_id)
+        else:
+            self.hw.leds(green=True)
+            self.cloud.publish("No Block")
+
+    # ------------- Main Loop -------------
+    async def run(self):
+        print("[SYSTEM] Smart Block Detection Node Active.")
+        try:
+            while True:
+                env = self.read_environment()
+                self.cloud.publish("Distance Reading", distance_cm=env["distance_cm"])
+                self.handle_gas(env["gas_alert"])
+
+                if env["distance_cm"] < 15:
+                    self.hw.leds(red=True)
+                    self.cloud.publish("Proximity Warning", distance=env["distance_cm"])
+                    print("[WARN] Object too close. Pausing servo.")
                 else:
-                    set_leds(green=True)
-                    print(f"[DETECT] Valid block detected (ID {block_id}).")
-                    publish_event("Valid Block", {"block_id": block_id})
-            else:
-                set_leds(green=True)
-                print("[INFO] No block detected in frame.")
-                publish_event("No Block")
+                    block_id = self.classify_block()
+                    self.handle_block(block_id)
 
-        time.sleep(1)
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print("[SYSTEM] Interrupted by user.")
+        finally:
+            self.hw.shutdown()
 
-except KeyboardInterrupt:
-    print("[SYSTEM] Interrupted by user.")
 
-finally:
-    servo_pwm.ChangeDutyCycle(0)
-    servo_pwm.stop()
-    GPIO.output(BUZZER_PIN, GPIO.LOW)
-    GPIO.cleanup()
-    print("[SYSTEM] GPIO cleanup complete. Program terminated.")
+# ------------------------------------------------------------------
+# Entrypoint
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    asyncio.run(SmartBlockSystem().run())
