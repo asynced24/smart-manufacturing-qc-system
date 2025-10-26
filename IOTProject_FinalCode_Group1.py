@@ -4,7 +4,7 @@
 SMART BLOCK DETECTION & REMOVAL SYSTEM  (Edge AI + IIoT + Cloud)
 ====================================================================
 
-High-level, modular implementation for an Industry 4.0 quality-control
+Modular implementation for an Industry 4.0 quality-control
 node running on a Raspberry Pi.  The system fuses vision, proximity,
 and environmental sensing for intelligent defect detection and
 actuation, streaming structured telemetry to a cloud broker (PubNub).
